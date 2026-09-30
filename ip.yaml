@@ -1,0 +1,46 @@
+name: spis
+version: 0.1.0
+spec: '0.2'
+kind: ip
+lang: bsv
+identity:
+  slug: spis-tapeout-bsv
+  display_name: SPI slave bus bridge
+  summary: 'An SPI slave that masters the on-chip bus: an off-chip host reads and writes
+    any address over four pins.'
+  category: interface
+  subcategories:
+  - spi
+  - bridge
+  ip_family: spis
+  maturity: simulated
+contract:
+  version: 1
+  ctrl:
+    shape: none
+    aw: 12
+    dw: 32
+params: {}
+test:
+  # 一次一笔的发起方，按契约可以不看 ready
+  deadread:
+  - rdy
+targets:
+  bsv:
+    driver: bsv
+emit:
+- kind: bsv
+  package: Spis
+  module: mkSpis
+  config_type: SpisCfg
+  interface: SpisIfc
+  pins:
+  - name: mgr
+    type: RegManager
+    targs:
+    - 32
+    - 32
+  - name: pins
+    type: SpisPins
+deps:
+  hwcore: ^0.1
