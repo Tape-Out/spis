@@ -7,12 +7,14 @@ import RegIf::*;
 // 模式 0（CPOL=0、CPHA=0），高位先出，cs_n 低有效。引脚按系统时钟过采样，
 // SCK 不能超过系统时钟的八分之一；cs_n 落下后至少隔四个系统时钟再给第一个 SCK。
 //
-//   写    0x02  a3 a2 a1 a0  d3 d2 d1 d0 [d3 …]      每满四字节写一笔，地址加四
-//   读    0x03  a3 a2 a1 a0  xx  q3 q2 q1 q0 [q3 …]  xx 是等总线的那一字节
-//   状态  0x05  s                                    s[0] 总线回过错，s[1] 主机快过总线；读完清零
-//   标识  0x9F  53 50 49 53                          "SPIS"，之后循环
+//   写      0x02  a3 a2 a1 a0  d3 d2 d1 d0 [d3 …]      每满四字节写一笔，地址加四
+//   读一字  0x03  a3 a2 a1 a0  xx  q3 q2 q1 q0         xx 是等总线的那一字节
+//   连读    0x0B  a3 a2 a1 a0  n  xx  q3 … q0 [q3 …]   读 n + 1 个字
+//   状态    0x05  s                                    s[0] 总线回过错，s[1] 主机快过总线；读完清零
+//   标识    0x9F  53 50 49 53                          "SPIS"，之后循环
 //
-// 字按大端上线，先出最高字节；地址的低两位不看。
+// 字按大端上线，先出最高字节；地址的低两位不看。读多少个字由命令说定，只读这么多：
+// 读寄存器可能有副作用（收 FIFO 出一个字节、读清的状态位），不许为了赶时间多读下一个。
 
 typedef struct {
   Bit#(0) none;
@@ -32,7 +34,7 @@ interface SpisIfc#(numeric type aw, numeric type dw);
   interface SpisPins pins;
 endinterface
 
-typedef enum { Cmd, Addr, Dummy, Data, Status, Ident, Skip } Ph deriving (Bits, Eq, FShow);
+typedef enum { Cmd, Addr, Count, Dummy, Data, Status, Ident, Skip } Ph deriving (Bits, Eq, FShow);
 
 function Bit#(8) ident(Bit#(2) k);
   case (k)
@@ -54,6 +56,9 @@ module mkSpis#(SpisCfg cfg)(SpisIfc#(aw, dw));
   Reg#(Bit#(7))  rx    <- mkReg(0);
   Reg#(Bit#(2))  k     <- mkReg(0);
   Reg#(Bool)     rd    <- mkReg(False);
+  Reg#(Bool)     burst <- mkReg(False);
+  Reg#(Bit#(8))  left  <- mkReg(0);     // 当前这一字之后还要读几个
+  Reg#(Bool)     rbufV <- mkReg(False);  // 最近发出的那一笔读回来了
   Reg#(Bit#(32)) addr  <- mkReg(0);
   Reg#(Bit#(24)) wacc  <- mkReg(0);
   Reg#(Bit#(32)) cur   <- mkReg(0);
@@ -81,12 +86,16 @@ module mkSpis#(SpisCfg cfg)(SpisIfc#(aw, dw));
   rule step;
     Bool pend = reqV;
     Bit#(32) rb = rbuf;
+    Bool rbv = rbufV;
     Bool be = busErr;
     Bool fst = fast;
     if (rspV) begin
       pend = False;
       if (rspX.err) be = True;
-      if (!reqR.write) rb = rspX.rdata;
+      if (!reqR.write) begin
+        rb = rspX.rdata;
+        rbv = True;
+      end
     end
 
     Ph p = ph;
@@ -94,6 +103,8 @@ module mkSpis#(SpisCfg cfg)(SpisIfc#(aw, dw));
     Bit#(7) r = rx;
     Bit#(2) kk = k;
     Bool isRd = rd;
+    Bool bst = burst;
+    Bit#(8) lf = left;
     Bit#(32) a = addr;
     Bit#(24) wa = wacc;
     Bit#(32) cw = cur;
@@ -118,7 +129,8 @@ module mkSpis#(SpisCfg cfg)(SpisIfc#(aw, dw));
             kk = 0;
             case (b)
               8'h02: begin p = Addr; isRd = False; end
-              8'h03: begin p = Addr; isRd = True; end
+              8'h03: begin p = Addr; isRd = True; bst = False; end
+              8'h0B: begin p = Addr; isRd = True; bst = True; end
               8'h05: begin
                 p = Status;
                 tx = {6'b0, pack(fst), pack(be)};
@@ -135,13 +147,19 @@ module mkSpis#(SpisCfg cfg)(SpisIfc#(aw, dw));
             else begin
               kk = 0;
               if (isRd) begin
-                p = Dummy;
+                // 第一个字总是要读的，现在就发，等计数与空字节的那一两字节里回来
+                p = bst ? Count : Dummy;
+                lf = 0;
                 go = tagged Valid RegReq { addr: {a[31:2], 2'b00}, write: False,
                                            wdata: 0, wstrb: 0 };
                 a = a + 4;
               end
               else p = Data;
             end
+          end
+          Count: begin
+            lf = b;
+            p = Dummy;
           end
           Dummy, Data: begin
             if (!isRd) begin
@@ -154,16 +172,23 @@ module mkSpis#(SpisCfg cfg)(SpisIfc#(aw, dw));
                 a = a + 4;
                 kk = 0;
               end
+            end else if (p == Data && kk == 3 && lf == 0) begin
+              // 说好的字读完了，后面只出 0，不再上总线
+              p = Skip;
+              tx = 0;
             end else if (p == Dummy || kk == 3) begin
-              // 换下一个字，并立刻去取再下一个：主机出完这一字的 32 位之前它得回来。
-              // 这一字没回来时上一笔必然还在途，下面发请求那里会记成主机太快
+              // 换下一个字；还有要读的就立刻去取，主机出完这一字的 32 位之前它得回来
+              if (p == Data) lf = lf - 1;
+              if (!rbv) fst = True;
               cw = rb;
               tx = rb[31:24];
-              go = tagged Valid RegReq { addr: {a[31:2], 2'b00}, write: False,
-                                         wdata: 0, wstrb: 0 };
-              a = a + 4;
               kk = 0;
               p = Data;
+              if (lf != 0) begin
+                go = tagged Valid RegReq { addr: {a[31:2], 2'b00}, write: False,
+                                           wdata: 0, wstrb: 0 };
+                a = a + 4;
+              end
             end else begin
               tx = (kk == 0) ? cw[23:16] : ((kk == 1) ? cw[15:8] : cw[7:0]);
               kk = kk + 1;
@@ -186,6 +211,7 @@ module mkSpis#(SpisCfg cfg)(SpisIfc#(aw, dw));
       else begin
         pend = True;
         reqR <= q;
+        if (!q.write) rbv = False;
       end
     end
 
@@ -197,6 +223,9 @@ module mkSpis#(SpisCfg cfg)(SpisIfc#(aw, dw));
     rx <= r;
     k <= kk;
     rd <= isRd;
+    burst <= bst;
+    left <= lf;
+    rbufV <= rbv;
     addr <= a;
     wacc <= wa;
     cur <= cw;

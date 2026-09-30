@@ -4,7 +4,9 @@
 逐字节核对 MISO，最后再直接查存储：
 
 - 标识读得出 "SPIS"；
-- 写两字再读回，突发读四字拿到存储原有的图样；
+- 写两字再读回，连读四字拿到存储原有的图样；
+- 读到存储最后一个字、连读正好收在最后一个字，状态字都是 0：说几个字就读几个，
+  不会为了赶时间多读下一个（下一个地址回错，多读一次就会置位）；
 - 写到回错的那一段，状态字 bit0 置位，读一次就清；
 - 地址只给了一半就拉高 cs_n，下一笔照常；
 - 读慢的那一段，数据来不及，状态字 bit1 置位——主机快过总线时它必须说出来。
@@ -45,10 +47,12 @@ def tx(send: list, want: list):
 
 
 def read(a: int, words: list):
-    exp = [None] * 6
+    """一个字用 0x03，多个字用 0x0B 并说明个数。"""
+    head = [0x03, *addr(a), 0] if len(words) == 1 else [0x0B, *addr(a), len(words) - 1, 0]
+    exp = [None] * len(head)
     for w in words:
         exp += [None] * 4 if w is None else be(w)
-    tx([0x03, *addr(a), 0] + [0] * 4 * len(words), exp)
+    tx(head + [0] * 4 * len(words), exp)
 
 
 W0, W1 = 0x11223344, 0x55667788
@@ -58,6 +62,14 @@ tx([0x9F, 0, 0, 0, 0, 0], [None, 0x53, 0x50, 0x49, 0x53, 0x53])
 tx([0x02, *addr(0x10), *be(W0), *be(W1)], [None] * 13)
 read(0x10, [W0, W1])
 read(0x40, [pat(0x10), pat(0x11), pat(0x12), pat(0x13)])
+tx([0x05, 0], [None, 0x00])
+# 存储的最后一个字后面紧挨着回错的地址：只读说好的那几个字，状态字就还是 0。
+# 读完多给几个字节也只出 0，不上总线
+read(0x3FC, [pat(0xFF)])
+tx([0x05, 0], [None, 0x00])
+read(0x3F0, [pat(0xFC), pat(0xFD), pat(0xFE), pat(0xFF)])
+tx([0x05, 0], [None, 0x00])
+tx([0x03, *addr(0x3FC), 0] + [0] * 12, [None] * 6 + be(pat(0xFF)) + [0] * 8)
 tx([0x05, 0], [None, 0x00])
 tx([0x02, *addr(0x2000), *be(0xDEADBEEF)], [None] * 9)
 tx([0x05, 0], [None, 0x01])

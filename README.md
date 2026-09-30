@@ -13,11 +13,12 @@ SPI mode 0 (CPOL 0, CPHA 0), most significant bit first, `cs_n` active low. Word
 | Command | Host sends | Chip answers |
 |:--:|:--:|:--:|
 | `0x02` write | `a3 a2 a1 a0`, then `d3 d2 d1 d0` per word | — |
-| `0x03` read | `a3 a2 a1 a0`, one dummy byte | `q3 q2 q1 q0` per word |
+| `0x03` read one word | `a3 a2 a1 a0`, one dummy byte | `q3 q2 q1 q0` |
+| `0x0B` read n + 1 words | `a3 a2 a1 a0`, `n`, one dummy byte | `q3 q2 q1 q0` per word |
 | `0x05` status | one byte | bit 0: the bus answered an error; bit 1: the host outran the bus. Cleared by the read |
 | `0x9F` identify | four bytes | `53 50 49 53` ("SPIS") |
 
-Each full word of a write becomes one bus write, and the address steps by four. A read fetches the next word while the current one shifts out, so a burst keeps going as long as the bus answers within 32 SCK periods. Raising `cs_n` ends the transaction at any byte.
+Each full word of a write becomes one bus write, and the address steps by four. A read touches exactly the words the command asks for: a register read can have a side effect (a receive FIFO pops, a status bit clears), so nothing is fetched ahead on speculation. Within a `0x0B` burst the next word is fetched while the current one shifts out, which works as long as the bus answers within 32 SCK periods; bytes clocked after the last word read as zero and touch nothing. Raising `cs_n` ends the transaction at any byte.
 
 The pins are oversampled by the system clock through a two-stage synchroniser: SCK must stay at or below one eighth of the system clock, and the host waits at least four system clocks after `cs_n` falls before the first SCK edge. `miso_oe` is high only while `cs_n` is low, so several chips can share MISO.
 
@@ -28,7 +29,7 @@ The pins are oversampled by the system clock through a two-stage synchroniser: S
 
 ## Testing
 
-`htest/mkspistb.py` generates a testbench that bit-bangs the host side against a bus model with plain memory, an erroring range and a slow range. It checks the identify bytes, a write read back, a four-word burst, the error flag and its clearing, a transaction cut off mid-address, and the too-fast flag on the slow range. Eight single-line mutations of the design each fail it.
+`htest/mkspistb.py` generates a testbench that bit-bangs the host side against a bus model with plain memory, an erroring range and a slow range. It checks the identify bytes, a write read back, a four-word burst, the error flag and its clearing, a transaction cut off mid-address, and the too-fast flag on the slow range. It also reads the last word before the erroring range, alone and as the end of a burst, and expects a clean status: one word too many would set the error flag. Nine single-line mutations of the design each fail it, one of them putting the speculative fetch back.
 
 ```console
 $ ran test spis
